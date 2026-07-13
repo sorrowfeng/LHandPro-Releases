@@ -10,6 +10,11 @@ from urllib import error, parse, request
 
 API_ROOT = "https://api.github.com"
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+ASSET_WAIT_ATTEMPTS = 12
+ASSET_WAIT_SECONDS = 10
+PUBLIC_RELEASE_TAG_RE = re.compile(
+    r"^LHandPro-v\d+\.\d+\.\d+-\d{4}-\d{2}-\d{2}-\d{2}-\d{2}$"
+)
 
 
 def log(message):
@@ -23,22 +28,20 @@ def require_env(name):
     return value
 
 
-def sort_key(tag_name):
-    parts = re.split(r"(\d+)", tag_name)
-    key = []
-    for part in parts:
-        if part.isdigit():
-            key.append((0, int(part)))
-        else:
-            key.append((1, part.lower()))
-    return key
-
-
 class GitHubClient:
     def __init__(self, token):
         self.token = token
 
-    def _send(self, method, url, data=None, headers=None, accept="application/vnd.github+json", raw=False):
+    def _send(
+        self,
+        method,
+        url,
+        data=None,
+        headers=None,
+        accept="application/vnd.github+json",
+        raw=False,
+        tolerate=(),
+    ):
         attempt = 0
         headers = dict(headers or {})
         headers.setdefault("Accept", accept)
@@ -61,6 +64,8 @@ class GitHubClient:
                     return json.loads(payload.decode("utf-8"))
             except error.HTTPError as exc:
                 payload = exc.read()
+                if exc.code in tolerate:
+                    return None
                 should_retry = exc.code in RETRYABLE_STATUS and attempt < 6
                 if should_retry:
                     delay = 2 ** (attempt - 1)
@@ -77,8 +82,8 @@ class GitHubClient:
                     continue
                 raise RuntimeError(f"Network error on {method} {url}: {exc}") from exc
 
-    def get(self, path):
-        return self._send("GET", f"{API_ROOT}{path}")
+    def get(self, path, tolerate=()):
+        return self._send("GET", f"{API_ROOT}{path}", tolerate=tolerate)
 
     def post(self, path, data):
         return self._send("POST", f"{API_ROOT}{path}", data=data)
@@ -106,18 +111,55 @@ class GitHubClient:
         )
 
 
-def list_releases(client, repo_full_name):
-    releases = []
-    page = 1
-    while True:
-        chunk = client.get(f"/repos/{repo_full_name}/releases?per_page=100&page={page}")
-        if not chunk:
-            break
-        releases.extend(chunk)
-        if len(chunk) < 100:
-            break
-        page += 1
-    return releases
+def validate_release_tag(tag_name):
+    if not PUBLIC_RELEASE_TAG_RE.fullmatch(tag_name):
+        raise RuntimeError(f"Release tag is not allowed for the public mirror: {tag_name}")
+
+
+def get_release_by_tag(client, repo_full_name, tag_name, tolerate_missing=False):
+    encoded_tag = parse.quote(tag_name, safe="")
+    tolerate = (404,) if tolerate_missing else ()
+    return client.get(f"/repos/{repo_full_name}/releases/tags/{encoded_tag}", tolerate=tolerate)
+
+
+def select_public_assets(source_release, tag_name):
+    asset_name_re = re.compile(rf"^{re.escape(tag_name)}-[0-9a-f]{{8}}\.zip$")
+    return {
+        asset["name"]: asset
+        for asset in source_release.get("assets", [])
+        if asset_name_re.fullmatch(asset["name"])
+    }
+
+
+def wait_for_source_release(source_client, source_repo, tag_name):
+    for attempt in range(1, ASSET_WAIT_ATTEMPTS + 1):
+        source_release = get_release_by_tag(
+            source_client,
+            source_repo,
+            tag_name,
+            tolerate_missing=True,
+        )
+        if source_release and source_release.get("draft"):
+            raise RuntimeError(f"Refusing to mirror draft release: {tag_name}")
+
+        source_assets = select_public_assets(source_release or {}, tag_name)
+        if len(source_assets) > 1:
+            names = ", ".join(sorted(source_assets))
+            raise RuntimeError(f"Release {tag_name} has multiple allowed assets: {names}")
+        if source_release and len(source_assets) == 1:
+            return source_release, source_assets
+
+        if attempt < ASSET_WAIT_ATTEMPTS:
+            log(
+                f"Release {tag_name} or its public zip asset is not ready; "
+                f"retrying in {ASSET_WAIT_SECONDS}s ({attempt}/{ASSET_WAIT_ATTEMPTS})"
+            )
+            time.sleep(ASSET_WAIT_SECONDS)
+
+    raise RuntimeError(
+        f"Release {tag_name} has no allowed asset after "
+        f"{ASSET_WAIT_ATTEMPTS} attempts"
+    )
 
 
 def ensure_release(target_client, target_repo, source_release, existing_release):
@@ -135,8 +177,7 @@ def ensure_release(target_client, target_repo, source_release, existing_release)
     return target_client.post(f"/repos/{target_repo}/releases", payload)
 
 
-def sync_assets(source_client, target_client, target_repo, source_release, target_release):
-    source_assets = {asset["name"]: asset for asset in source_release.get("assets", [])}
+def sync_assets(source_client, target_client, target_repo, source_assets, target_release):
     target_assets = {asset["name"]: asset for asset in target_release.get("assets", [])}
 
     for target_name, target_asset in sorted(target_assets.items()):
@@ -172,30 +213,37 @@ def main():
     source_repo = require_env("SRC_REPO")
     target_token = require_env("GITHUB_TOKEN")
     source_token = require_env("SRC_REPO_TOKEN")
+    release_tag = require_env("RELEASE_TAG")
+
+    validate_release_tag(release_tag)
 
     source_client = GitHubClient(source_token)
     target_client = GitHubClient(target_token)
 
-    source_releases = [
-        release for release in list_releases(source_client, source_repo) if not release.get("draft")
-    ]
-    source_releases.sort(key=lambda item: sort_key(item["tag_name"]))
-    target_releases = list_releases(target_client, target_repo)
-    target_by_tag = {release["tag_name"]: release for release in target_releases}
+    source_release, source_assets = wait_for_source_release(
+        source_client,
+        source_repo,
+        release_tag,
+    )
+    for asset in source_release.get("assets", []):
+        if asset["name"] not in source_assets:
+            log(f"Skipping non-public asset {release_tag}/{asset['name']}")
 
-    log(f"Found {len(source_releases)} source releases in {source_repo}")
-    log(f"Found {len(target_releases)} target releases in {target_repo}")
+    target_release = get_release_by_tag(
+        target_client,
+        target_repo,
+        release_tag,
+        tolerate_missing=True,
+    )
+    target_release = ensure_release(
+        target_client,
+        target_repo,
+        source_release,
+        target_release,
+    )
+    sync_assets(source_client, target_client, target_repo, source_assets, target_release)
 
-    for source_release in source_releases:
-        target_release = ensure_release(
-            target_client,
-            target_repo,
-            source_release,
-            target_by_tag.get(source_release["tag_name"]),
-        )
-        sync_assets(source_client, target_client, target_repo, source_release, target_release)
-
-    log("Release sync completed")
+    log(f"Release sync completed for {release_tag}")
 
 
 if __name__ == "__main__":

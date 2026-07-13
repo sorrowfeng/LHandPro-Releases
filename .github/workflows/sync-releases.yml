@@ -2,19 +2,23 @@ name: Sync Releases
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "17 */6 * * *"
+    inputs:
+      release_tag:
+        description: Source LHandPro release tag to mirror
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 concurrency:
-  group: sync-releases
+  group: sync-release-${{ inputs.release_tag }}
   cancel-in-progress: false
 
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -24,10 +28,14 @@ jobs:
         with:
           python-version: "3.x"
 
-      - name: Sync source releases
+      - name: Test release sync filters
+        run: python .github/scripts/test_sync_releases.py
+
+      - name: Sync source release
         env:
           TARGET_REPO: ${{ github.repository }}
           GITHUB_TOKEN: ${{ github.token }}
           SRC_REPO: sorrowfeng/LHandPro
           SRC_REPO_TOKEN: ${{ secrets.SRC_REPO_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: python .github/scripts/sync_releases.py
