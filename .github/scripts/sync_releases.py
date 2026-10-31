@@ -15,6 +15,9 @@ ASSET_WAIT_SECONDS = 10
 PUBLIC_RELEASE_TAG_RE = re.compile(
     r"^LHandPro-v\d+\.\d+\.\d+-\d{4}-\d{2}-\d{2}-\d{2}-\d{2}$"
 )
+# 源码包不镜像:GitHub 的 "Source code (zip/tar.gz)" 不在 assets 里,这里兜底挡住
+# 手工上传的源码压缩包(dist 里的 src-*.zip 之类)。
+SOURCE_ARCHIVE_NAME_RE = re.compile(r"^(src-.*|source.?code.*)\.(zip|tar\.gz|tgz)$", re.IGNORECASE)
 
 
 def log(message):
@@ -122,13 +125,26 @@ def get_release_by_tag(client, repo_full_name, tag_name, tolerate_missing=False)
     return client.get(f"/repos/{repo_full_name}/releases/tags/{encoded_tag}", tolerate=tolerate)
 
 
-def select_public_assets(source_release, tag_name):
-    asset_name_re = re.compile(rf"^{re.escape(tag_name)}-[0-9a-f]{{8}}\.zip$")
-    return {
-        asset["name"]: asset
-        for asset in source_release.get("assets", [])
-        if asset_name_re.fullmatch(asset["name"])
-    }
+def select_mirrored_assets(source_release):
+    """镜像 Release 里的**全部**资产(各平台安装包、绿色包、校验和等)。
+
+    GitHub 页面上的 "Source code (zip/tar.gz)" 两项不是 Release 资产,API 也不
+    会返回,所以这里不需要白名单;只做三项防御性过滤:
+      1. 名字为空的异常数据;
+      2. state 不是 uploaded 的半成品(拉下来会是坏包);
+      3. 命中源码包命名(src-*.zip / Source code.zip 等)的手工上传残留。
+    """
+    selected = {}
+    for asset in source_release.get("assets", []):
+        name = asset.get("name") or ""
+        if not name or name in selected:
+            continue
+        if (asset.get("state") or "uploaded") != "uploaded":
+            continue
+        if SOURCE_ARCHIVE_NAME_RE.fullmatch(name):
+            continue
+        selected[name] = asset
+    return selected
 
 
 def wait_for_source_release(source_client, source_repo, tag_name):
@@ -142,22 +158,19 @@ def wait_for_source_release(source_client, source_repo, tag_name):
         if source_release and source_release.get("draft"):
             raise RuntimeError(f"Refusing to mirror draft release: {tag_name}")
 
-        source_assets = select_public_assets(source_release or {}, tag_name)
-        if len(source_assets) > 1:
-            names = ", ".join(sorted(source_assets))
-            raise RuntimeError(f"Release {tag_name} has multiple allowed assets: {names}")
-        if source_release and len(source_assets) == 1:
+        source_assets = select_mirrored_assets(source_release or {})
+        if source_release and source_assets:
             return source_release, source_assets
 
         if attempt < ASSET_WAIT_ATTEMPTS:
             log(
-                f"Release {tag_name} or its public zip asset is not ready; "
+                f"Release {tag_name} or its assets are not ready; "
                 f"retrying in {ASSET_WAIT_SECONDS}s ({attempt}/{ASSET_WAIT_ATTEMPTS})"
             )
             time.sleep(ASSET_WAIT_SECONDS)
 
     raise RuntimeError(
-        f"Release {tag_name} has no allowed asset after "
+        f"Release {tag_name} has no mirrorable asset after "
         f"{ASSET_WAIT_ATTEMPTS} attempts"
     )
 
@@ -227,7 +240,11 @@ def main():
     )
     for asset in source_release.get("assets", []):
         if asset["name"] not in source_assets:
-            log(f"Skipping non-public asset {release_tag}/{asset['name']}")
+            log(
+                f"Skipping asset {release_tag}/{asset['name']} "
+                "(source archive or not fully uploaded)"
+            )
+    log(f"Mirroring {len(source_assets)} asset(s) from {release_tag}")
 
     target_release = get_release_by_tag(
         target_client,
