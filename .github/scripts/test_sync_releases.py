@@ -1,8 +1,7 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 import unittest
 
 import sync_releases
-
 
 class ReleaseFilterTests(unittest.TestCase):
     def test_accepts_standard_release_tag(self):
@@ -79,6 +78,31 @@ class ReleaseFilterTests(unittest.TestCase):
     def test_empty_release_has_no_assets(self):
         self.assertEqual({}, sync_releases.select_mirrored_assets({}))
 
+class AssetCompareTests(unittest.TestCase):
+    def test_missing_target_needs_upload(self):
+        self.assertTrue(sync_releases.asset_needs_upload(None, {'name': 'a.zip'}))
+
+    def test_identical_asset_is_kept(self):
+        asset = {'name': 'a.zip', 'size': 10, 'label': '', 'content_type': 'application/zip',
+                 'digest': 'sha256:aa'}
+        self.assertFalse(sync_releases.asset_needs_upload(dict(asset), dict(asset)))
+
+    def test_same_size_different_digest_is_replaced(self):
+        target = {'name': 'SHA256SUMS.v1.4.5', 'size': 500, 'label': '',
+                  'content_type': 'text/plain', 'digest': 'sha256:old'}
+        source = {'name': 'SHA256SUMS.v1.4.5', 'size': 500, 'label': '',
+                  'content_type': 'text/plain', 'digest': 'sha256:new'}
+        self.assertTrue(sync_releases.asset_needs_upload(target, source))
+
+    def test_digest_missing_falls_back_to_metadata(self):
+        target = {'name': 'a.zip', 'size': 10, 'label': '', 'content_type': 'application/zip'}
+        source = {'name': 'a.zip', 'size': 10, 'label': '', 'content_type': 'application/zip'}
+        self.assertFalse(sync_releases.asset_needs_upload(target, source))
+
+    def test_size_change_is_replaced(self):
+        target = {'name': 'a.zip', 'size': 10, 'label': '', 'content_type': 'application/zip'}
+        source = {'name': 'a.zip', 'size': 11, 'label': '', 'content_type': 'application/zip'}
+        self.assertTrue(sync_releases.asset_needs_upload(target, source))
 
 if __name__ == "__main__":
     unittest.main()

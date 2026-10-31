@@ -190,6 +190,27 @@ def ensure_release(target_client, target_repo, source_release, existing_release)
     return target_client.post(f"/repos/{target_repo}/releases", payload)
 
 
+def asset_needs_upload(target_asset, source_asset):
+    """镜像侧资产是否需要用源资产覆盖。
+
+    size 相同不代表内容相同:同名同尺寸但被重新上传过的包(例如同一版本重打的
+    安装包、只改了校验和的 SHA256SUMS)必须靠 digest 判断,否则会一直保留旧内容。
+    """
+    if target_asset is None:
+        return True
+    if (target_asset.get("label") or "") != (source_asset.get("label") or ""):
+        return True
+    if target_asset.get("size") != source_asset.get("size"):
+        return True
+    if target_asset.get("content_type") != source_asset.get("content_type"):
+        return True
+    target_digest = target_asset.get("digest")
+    source_digest = source_asset.get("digest")
+    if target_digest and source_digest:
+        return target_digest != source_digest
+    return False
+
+
 def sync_assets(source_client, target_client, target_repo, source_assets, target_release):
     target_assets = {asset["name"]: asset for asset in target_release.get("assets", [])}
 
@@ -204,12 +225,7 @@ def sync_assets(source_client, target_client, target_repo, source_assets, target
 
     for name, source_asset in sorted(source_assets.items()):
         target_asset = target_assets.get(name)
-        needs_upload = (
-            target_asset is None
-            or (target_asset.get("label") or "") != (source_asset.get("label") or "")
-            or target_asset.get("size") != source_asset.get("size")
-            or target_asset.get("content_type") != source_asset.get("content_type")
-        )
+        needs_upload = asset_needs_upload(target_asset, source_asset)
         if target_asset and needs_upload:
             log(f"Replacing asset {target_release['tag_name']}/{name}")
             target_client.delete(f"/repos/{target_repo}/releases/assets/{target_asset['id']}")
